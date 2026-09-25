@@ -3,7 +3,6 @@
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>GHMultiMonitor</AssemblyName>
     <LangVersion>latest</LangVersion>
-    <!-- CHANGE THESE TWO LINES to match your game folder -->
     <GameDir>G:\SteamLibrary\steamapps\common\Grey Hack</GameDir>
     <ManagedDir>$(GameDir)\Grey Hack_Data\Managed</ManagedDir>
   </PropertyGroup>
@@ -22,6 +21,7 @@
     <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(ManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(ManagedDir)\UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(ManagedDir)\UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Assembly-CSharp"><HintPath>$(ManagedDir)\Assembly-CSharp.dll</HintPath><Aliases>GH</Aliases><Private>false</Private></Reference>
   </ItemGroup>
 
   <!-- Automatically copies the finished mod into BepInEx\plugins -->
