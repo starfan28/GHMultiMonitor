@@ -16,7 +16,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
 {
     public const string Guid = "com.bobby.greyhack.multimonitor";
     public const string PluginName = "GHMultiMonitor";
-    public const string Version = "1.0.1";
+    public const string Version = "1.0.2";
 
     static readonly string[] SupportedGameVersions = { "0.9.6", "0.9.7" }; // game versions starting with any of these are allowed
     static readonly string[] BarNames = { "TaskBar", "BarraSupDesktop" };   // desktop bars windows must not cover
@@ -33,6 +33,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     ConfigEntry<string> backgroundSources;
     ConfigEntry<string> backgroundPath;
     ConfigEntry<string> excludedScreens;
+    ConfigEntry<bool> rememberWindows;
     ConfigEntry<bool> snapEnabled;
     ConfigEntry<float> snapDelay;
     ConfigEntry<float> snapEdgeSize;
@@ -56,6 +57,8 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     float nextCanvasSync;
     readonly Dictionary<int, RectTransform> containers = new Dictionary<int, RectTransform>(); // display -> window holder
     readonly Dictionary<int, GameObject> secondaryCanvases = new Dictionary<int, GameObject>();
+    readonly Dictionary<int, GraphicRaycaster> secondaryCasters = new Dictionary<int, GraphicRaycaster>(); // each extra canvas's raycaster
+    GraphicRaycaster mainCaster;
     readonly Dictionary<int, Camera> clearCameras = new Dictionary<int, Camera>();
     readonly HashSet<int> activatedDisplays = new HashSet<int>(); // Unity can't turn these off again
     readonly List<int> wantedDisplays = new List<int>();  // monitors in use this session
@@ -81,16 +84,33 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     readonly Dictionary<string, Placement> placements = new Dictionary<string, Placement>();
     readonly Dictionary<Transform, bool> windowActive = new Dictionary<Transform, bool>(); // last seen open/closed state
     readonly Dictionary<Transform, float> openedWindows = new Dictionary<Transform, float>(); // window -> time it opened
-        class Snapshot
+    class Snapshot
     {
         public string Name;
         public int Display;
         public Rect Norm;
     }
     readonly Dictionary<Transform, Snapshot> openSnapshots = new Dictionary<Transform, Snapshot>(); // last known spot of each open window
+    readonly Dictionary<Transform, bool> skipCache = new Dictionary<Transform, bool>(); // bars and temporary objects, worked out once per object
+    readonly List<Transform> transformScratch = new List<Transform>(); // reused so the per-frame loops don't allocate
+    readonly List<KeyValuePair<Transform, float>> openedScratch = new List<KeyValuePair<Transform, float>>();
+    float nextSnapshotCapture;
+    bool overlaysShown;
     bool placementsDirty;
     float nextPlacementRefresh;
     string PlacementsFile => Path.Combine(Paths.ConfigPath, Guid + ".windows.txt");
+
+    // Which monitor each desktop icon is on (icons not listed are on the main screen)
+    class IconSpot
+    {
+        public int Display;
+        public bool Free; // dropped at a spot on the desktop; otherwise it sits in that monitor's icon grid
+        public Rect Norm; // where it sits when Free, as fractions of the monitor
+    }
+    readonly Dictionary<string, IconSpot> iconSpots = new Dictionary<string, IconSpot>();
+    bool iconSpotsDirty;
+    float nextIconSync;
+    string IconSpotsFile => Path.Combine(Paths.ConfigPath, Guid + ".icons.txt");
 
     // Error handling
     readonly HashSet<string> loggedErrors = new HashSet<string>();
@@ -99,6 +119,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     bool showMenu;
     bool[] menuSelection;
     bool menuSnap;
+    bool menuRemember;
     float menuDelay, menuEdge, menuCorner;
     Rect menuRect;
     int menuAction; // 0 = nothing, 1 = save, 2 = cancel, 3 = bring windows back, 4 = forget positions
@@ -121,6 +142,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         public Transform Parent;
         public Vector3 LocalPos;
         public int Display;
+        public int Sibling = -1; // for icons, so they keep their place in the grid
     }
     class PendingDialog
     {
@@ -139,7 +161,10 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     readonly Dictionary<Transform, MenuHome> menuHomes = new Dictionary<Transform, MenuHome>(); // where each menu normally lives
     Transform menuOnOtherMonitor;
     GH::ContextualMenu mainMenu;
+    GH::ContextualMenuClipboard mainClipboardMenu;
     static AccessTools.FieldRef<GH::InteractableContextual, GH::ContextualMenu> contextualMenuRef;
+    static AccessTools.FieldRef<GH::ClipboardInteractableContextual, GH::ContextualMenuClipboard> clipboardMenuRef;
+    static AccessTools.FieldRef<GH::ClipboardICText, GH::ContextualMenuClipboard> clipboardTextMenuRef;
 
     Transform pressedIcon; // the real desktop icon being dragged (the game drags a copy of it around)
     Transform dragCopy;    // the game's copy of the icon that follows the cursor
@@ -188,6 +213,10 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         windowContainerPath = Config.Bind("General", "WindowContainerPath", DefaultDesktopPath,
             "Hierarchy path of the object that holds the in-game windows. Only change this if a game update moves it.");
 
+        // Windows
+        rememberWindows = Config.Bind("Windows", "RememberWindowPositions", true,
+            "Reopen windows where you last put them. Turn off to let the game place windows itself. Saved positions are kept while this is off. Set from the in-game menu.");
+
         // Background
         backgroundSources = Config.Bind("Background", "BackgroundSources", "DesktopFinder.desktopBackground,Apariencia.desktopImage",
             "Game variables (ClassName.variableName) to read the desktop background from, tried in order.");
@@ -216,6 +245,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
             "Writes a numbered marker line to the log, handy for noting when something happened.");
 
         LoadPlacements();
+        LoadIconSpots();
 
         Logger.LogInfo($"Displays detected: {Display.displays.Length}");
         for (int i = 0; i < Display.displays.Length; i++)
@@ -247,7 +277,9 @@ public class MultiMonitorPlugin : BaseUnityPlugin
 
     void OnApplicationQuit()
     {
-        if (!unsupported && placementsDirty) SavePlacements();
+        if (unsupported) return;
+        if (placementsDirty) SavePlacements();
+        if (iconSpotsDirty) SaveIconSpots();
     }
 
     // ---------------- Error safety net ----------------
@@ -279,6 +311,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         {
             if (!showMenu && mainContainer != null) TrackWindows(); // runs after the game's own code each frame
             if (!showMenu && mainContainer != null) UpdateIconDrag();
+            if (!showMenu && mainContainer != null) KeepDragIconOnCursor();
             LateUpdateInner();
         }
         catch (System.Exception e) { HandleError("LateUpdate", e); }
@@ -342,6 +375,13 @@ public class MultiMonitorPlugin : BaseUnityPlugin
 
         UpdateWebCaster();
 
+        if (Time.unscaledTime >= nextIconSync)
+        {
+            nextIconSync = Time.unscaledTime + 0.25f;
+            SyncDesktopIcons();
+            if (iconSpotsDirty) SaveIconSpots();
+        }
+
         if (Input.GetMouseButtonDown(0)) CloseStrayMenu();
         if (Input.GetMouseButtonDown(0)) BeginPress();
         // Mouse release is handled in LateUpdate, after the game has finished its own drag handling
@@ -400,6 +440,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         EndPress();
         for (int i = 0; i < menuSelection.Length; i++) menuSelection[i] = savedDisplays.Contains(i);
         menuSnap = snapEnabled.Value;
+        menuRemember = rememberWindows.Value;
         menuDelay = snapDelay.Value;
         menuEdge = snapEdgeSize.Value;
         menuCorner = snapCornerSize.Value;
@@ -498,7 +539,10 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         }
 
         GUILayout.Space(8);
-        GUILayout.Label($"Windows reopen where you last put them ({placements.Count} remembered).");
+        menuRemember = GUILayout.Toggle(menuRemember, "  Reopen windows where you last put them");
+        GUILayout.Label(menuRemember
+            ? $"{placements.Count} window position(s) remembered."
+            : $"Off: the game places windows itself. {placements.Count} saved position(s) are kept for if you turn this back on.");
         GUILayout.BeginHorizontal();
         if (GUILayout.Button("Bring all windows to main screen")) menuAction = 3;
         if (GUILayout.Button("Forget saved window positions")) menuAction = 4;
@@ -535,6 +579,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         savedDisplays.Clear();
         savedDisplays.AddRange(chosen);
         snapEnabled.Value = menuSnap;
+        rememberWindows.Value = menuRemember;
         snapDelay.Value = menuDelay;
         snapEdgeSize.Value = menuEdge;
         snapCornerSize.Value = menuCorner;
@@ -578,9 +623,10 @@ public class MultiMonitorPlugin : BaseUnityPlugin
             var t = mainCanvas.GetComponentInChildren<Text>(true);
             if (t != null && t.font != null) return labelFont = t.font;
         }
-        try { labelFont = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"); } catch { }
+        // Older Unity versions only have Arial.ttf; newer ones only have LegacyRuntime.ttf (and throw for the other)
+        try { labelFont = Resources.GetBuiltinResource<Font>("Arial.ttf"); } catch { }
         if (labelFont == null)
-            try { labelFont = Resources.GetBuiltinResource<Font>("Arial.ttf"); } catch { }
+            try { labelFont = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"); } catch { }
         return labelFont;
     }
 
@@ -645,13 +691,22 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     // Positions are measured from the bottom-left of each monitor
     void UpdateScreenOverlays()
     {
+        if (!showMenu)
+        {
+            if (!overlaysShown) return; // this runs every frame, so don't do anything when there's nothing to hide
+            overlaysShown = false;
+            foreach (var kv in screenOverlays)
+                if (kv.Value.Root != null && kv.Value.Root.activeSelf) kv.Value.Root.SetActive(false);
+            return;
+        }
+        overlaysShown = true;
+
         var displays = new List<int> { 0 };
         displays.AddRange(activatedDisplays);
 
         foreach (var kv in screenOverlays)
-            if (kv.Value.Root != null && kv.Value.Root.activeSelf && (!showMenu || !displays.Contains(kv.Key)))
+            if (kv.Value.Root != null && kv.Value.Root.activeSelf && !displays.Contains(kv.Key))
                 kv.Value.Root.SetActive(false);
-        if (!showMenu) return;
 
         foreach (int d in displays)
         {
@@ -754,14 +809,20 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         windowActive.Clear();
         openedWindows.Clear();
         openSnapshots.Clear();
+        skipCache.Clear();
+        secondaryCasters.Clear();
         lastBackgroundDescription = null;
         loggedNoBackground = false;
 
         mainContainer = (RectTransform)go.transform;
         mainCanvas = go.GetComponentInParent<Canvas>().rootCanvas;
         mainMenu = mainCanvas.GetComponentInChildren<GH::ContextualMenu>();
+        mainClipboardMenu = mainCanvas.GetComponentInChildren<GH::ContextualMenuClipboard>();
+        mainCaster = mainCanvas.GetComponent<GraphicRaycaster>();
         containers[0] = mainContainer;
-        mainIcons = mainContainer.Find(IconsName) as RectTransform;
+        // The game puts desktop icons under the desktop finder's 'contenido' object, so prefer that over guessing by name
+        var contenido = GH::DesktopFinder.Singleton != null ? GH::DesktopFinder.Singleton.contenido : null;
+        mainIcons = (contenido != null ? contenido.transform : mainContainer.Find(IconsName)) as RectTransform;
         if (mainIcons != null) iconContainers[0] = mainIcons;
         else LogOnce($"No '{IconsName}' found on the desktop; desktop icons will stay on the main screen.");
 
@@ -806,7 +867,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
             scaler.scaleFactor = mainScaler.scaleFactor;
             scaler.referencePixelsPerUnit = mainScaler.referencePixelsPerUnit;
         }
-        canvasGO.AddComponent<GraphicRaycaster>();
+        secondaryCasters[idx] = canvasGO.AddComponent<GraphicRaycaster>();
 
         // Background goes in first so it's drawn behind the windows
         var bgGO = new GameObject("MM_Background", typeof(RectTransform));
@@ -818,12 +879,27 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         bg.enabled = false; // shown once a background is found
         secondaryBackgrounds[idx] = bg;
 
+        // Invisible layer over the wallpaper that catches clicks and drops on the empty desktop
+        var hitGO = new GameObject("MM_DesktopHit", typeof(RectTransform));
+        var hitRT = (RectTransform)hitGO.transform;
+        hitRT.SetParent(canvasGO.transform, false);
+        Stretch(hitRT);
+        var hitImg = hitGO.AddComponent<Image>();
+        hitImg.color = new Color(0f, 0f, 0f, 0f);
+        hitImg.raycastTarget = true;
+        hitImg.canvasRenderer.cullTransparentMesh = false; // fully see-through graphics are skipped by raycasts otherwise
+        var proxy = hitGO.AddComponent<MultiMonitorDesktopProxy>();
+        proxy.Display = idx;
+        proxy.Clicked = DesktopClicked;
+        proxy.Dropped = DesktopDropped;
+
         // Desktop icons go between the wallpaper and the windows, like on the main screen
         var iconsGO = new GameObject("MM_Icons", typeof(RectTransform));
         var iconsRT = (RectTransform)iconsGO.transform;
         iconsRT.SetParent(canvasGO.transform, false);
         Stretch(iconsRT);
         iconContainers[idx] = iconsRT;
+        CopyIconGrid(iconsRT);
 
         var container = new GameObject("MM_Windows", typeof(RectTransform));
         var rt = (RectTransform)container.transform;
@@ -868,6 +944,15 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     static bool IsBar(Transform t)
     {
         return BarNames.Contains(t.name);
+    }
+
+    // IsBar and IsTransient read the object's name (which makes a new string each time), and never change for
+    // an object, so the per-frame loops ask this instead
+    bool IsSkipped(Transform t)
+    {
+        if (!skipCache.TryGetValue(t, out bool skip))
+            skipCache[t] = skip = IsBar(t) || IsTransient(t);
+        return skip;
     }
 
     // Brings a window to the front, but keeps it underneath any bars drawn on top
@@ -964,8 +1049,6 @@ public class MultiMonitorPlugin : BaseUnityPlugin
 
     // Watches for windows opening (new ones, or hidden ones shown again) and puts them back where
     // they were last time. Also keeps saved positions up to date while remembered windows are open.
-       // Watches for windows opening (new ones, or hidden ones shown again) and puts them back where
-    // they were last time. Also keeps saved positions up to date while remembered windows are open.
     void TrackWindows()
     {
         float now = Time.unscaledTime;
@@ -978,7 +1061,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
             for (int i = 0; i < c.childCount; i++)
             {
                 var t = c.GetChild(i);
-                if (IsBar(t) || IsTransient(t)) continue;
+                if (IsSkipped(t)) continue;
                 bool active = t.gameObject.activeSelf;
                 bool opened = windowActive.TryGetValue(t, out bool wasActive)
                     ? active && !wasActive  // hidden window shown again
@@ -1000,7 +1083,9 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         // For a short moment, keep them there in case the game repositions them a frame later
         if (openedWindows.Count > 0)
         {
-            foreach (var kv in openedWindows.ToList())
+            openedScratch.Clear();
+            foreach (var kv in openedWindows) openedScratch.Add(kv);
+            foreach (var kv in openedScratch)
             {
                 if (kv.Key == null || now - kv.Value > WindowSettleTime) { openedWindows.Remove(kv.Key); continue; }
                 if (kv.Key != pressedWindow) RestorePlacement(kv.Key, false);
@@ -1013,6 +1098,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
 
             // Forget windows that have been destroyed
             foreach (var k in windowActive.Keys.Where(k => k == null).ToList()) windowActive.Remove(k);
+            foreach (var k in skipCache.Keys.Where(k => k == null).ToList()) skipCache.Remove(k);
 
             // Keep remembered windows' saved positions current (e.g. after resizing them)
             foreach (var c in containers.Values)
@@ -1036,6 +1122,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     {
         var win = t as RectTransform;
         if (win == null || !win.gameObject.activeInHierarchy) return false;
+        if (!rememberWindows.Value) return false; // remembering is turned off
         if (IsNoMemory(win.name)) return false; // the game decides where these open
         if (!placements.TryGetValue(win.name, out var p)) return false;
         if (!containers.TryGetValue(p.Display, out var target) || target == null) return false; // that monitor isn't on
@@ -1061,16 +1148,24 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     // minimized), its last spot becomes the saved position, so the last window closed wins.
     void UpdateSnapshots()
     {
+        if (!rememberWindows.Value)
+        {
+            openSnapshots.Clear(); // nothing gets saved while remembering is off
+            return;
+        }
+
         // Save the spot of any window that has just closed
         if (openSnapshots.Count > 0)
         {
-            foreach (var kv in openSnapshots.ToList())
+            transformScratch.Clear();
+            foreach (var kv in openSnapshots)
+                if (kv.Key == null || !kv.Key.gameObject.activeSelf) transformScratch.Add(kv.Key);
+
+            foreach (var t in transformScratch)
             {
-                var t = kv.Key;
-                if (t != null && t.gameObject.activeSelf) continue; // still open
+                if (!openSnapshots.TryGetValue(t, out var s)) continue;
                 openSnapshots.Remove(t);
 
-                var s = kv.Value;
                 if (!placements.TryGetValue(s.Name, out var p) || p.Display != s.Display || !Same(p.Norm, s.Norm))
                 {
                     placements[s.Name] = new Placement { Display = s.Display, Norm = s.Norm };
@@ -1079,14 +1174,18 @@ public class MultiMonitorPlugin : BaseUnityPlugin
             }
         }
 
-        // Note the current spot of every open window of a remembered app
+        // Note the current spot of every open window of a remembered app (a few times a second is plenty)
+        if (Time.unscaledTime < nextSnapshotCapture) return;
+        nextSnapshotCapture = Time.unscaledTime + 0.1f;
+
         foreach (var kv in containers)
         {
             var c = kv.Value;
             if (c == null) continue;
-            foreach (Transform child in c)
+            for (int i = 0; i < c.childCount; i++)
             {
-                if (IsBar(child) || !child.gameObject.activeSelf) continue;
+                var child = c.GetChild(i);
+                if (IsSkipped(child) || !child.gameObject.activeSelf) continue;
                 if (!placements.ContainsKey(child.name) || openedWindows.ContainsKey(child)) continue;
                 var win = child as RectTransform;
                 if (win == null) continue;
@@ -1117,7 +1216,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         var win = t as RectTransform;
         var container = t.parent as RectTransform;
         int display = DisplayOf(container);
-        if (win == null || display < 0 || IsBar(t) || IsNoMemory(t.name)) return;
+        if (!rememberWindows.Value || win == null || display < 0 || IsBar(t) || IsNoMemory(t.name)) return;
 
         Rect norm = ToNorm(win, container);
         if (placements.TryGetValue(win.name, out var p) && p.Display == display && Same(p.Norm, norm)) return;
@@ -1130,10 +1229,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     bool OverlapsSameApp(RectTransform win, RectTransform container, Rect n)
     {
         // Where the window would end up (the same math FromNorm uses)
-        Rect c = container.rect;
-        float w = n.width * c.width, h = n.height * c.height;
-        float px = c.xMin + n.x * c.width, py = c.yMin + n.y * c.height;
-        var target = new Rect(px - win.pivot.x * w, py - win.pivot.y * h, w, h);
+        Rect target = NormToLocal(container, n);
 
         foreach (Transform other in container)
         {
@@ -1150,22 +1246,25 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         return false;
     }
 
-    // Stores a window's position (its pivot point) and size as fractions of its monitor, so they
-    // still make sense if the resolution changes
+    // Stores a window's bottom-left corner and size as fractions of its monitor, so they still make
+    // sense if the resolution changes. The corner is used rather than the pivot point, because the
+    // game moves a window's pivot around while it's being resized.
     static Rect ToNorm(RectTransform win, RectTransform container)
     {
         Rect c = container.rect;
-        Vector2 size = win.rect.size;
-        Vector3 p = win.localPosition;
-        return new Rect((p.x - c.xMin) / c.width, (p.y - c.yMin) / c.height, size.x / c.width, size.y / c.height);
+        Rect r = LocalRectOf(win);
+        return new Rect((r.x - c.xMin) / c.width, (r.y - c.yMin) / c.height, r.width / c.width, r.height / c.height);
+    }
+
+    static Rect NormToLocal(RectTransform container, Rect n)
+    {
+        Rect c = container.rect;
+        return new Rect(c.xMin + n.x * c.width, c.yMin + n.y * c.height, n.width * c.width, n.height * c.height);
     }
 
     static void FromNorm(RectTransform win, RectTransform container, Rect n)
     {
-        Rect c = container.rect;
-        win.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, n.width * c.width);
-        win.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, n.height * c.height);
-        win.localPosition = new Vector3(c.xMin + n.x * c.width, c.yMin + n.y * c.height, win.localPosition.z);
+        SetLocalRect(win, NormToLocal(container, n));
     }
 
     static bool Same(Rect a, Rect b)
@@ -1229,6 +1328,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     void ForgetPlacements()
     {
         placements.Clear();
+        openSnapshots.Clear(); // otherwise a window that's still open would save its spot again when it closes
         placementsDirty = false;
         try { if (File.Exists(PlacementsFile)) File.Delete(PlacementsFile); } catch { }
         Logger.LogInfo("Forgot all remembered window positions.");
@@ -1585,11 +1685,20 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         // Forget windows that have been closed
         foreach (var k in restoreSizes.Keys.Where(k => k == null).ToList()) restoreSizes.Remove(k);
 
+        // Grabbing a window's edge to resize it isn't a move: the game shifts the window's pivot at that point,
+        // which would look like a drag (and could snap the window or fight the resize)
+        var resized = ResizeHandleUnderCursor();
+        if (resized != null)
+        {
+            restoreSizes.Remove(resized); // no longer the size it had before snapping
+            return;
+        }
+
         var win = DraggableUnderCursor(out bool isIcon);
         if (win == null) return;
         if (isIcon)
         {
-            return; // icon dragging is fucked
+            return; // moving desktop icons between monitors isn't supported yet
         }
         GetMouse(out _, out Vector2 mousePos);
         if (!ScreenToLocal((RectTransform)win.parent, mousePos, out Vector2 local)) return;
@@ -1847,6 +1956,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     {
         markerCount++;
         Logger.LogInfo($"===== Marker {markerCount} =====");
+        DumpDesktopIcons();
     }
 
     static void Stretch(RectTransform rt)
@@ -1904,7 +2014,23 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         return Rect.MinMaxRect(a.x, a.y, b.x, b.y);
     }
 
-       // Finds the window or desktop icon under the cursor that can be dragged between monitors
+    // If the topmost thing under the cursor is one of a window's resize handles, returns that window
+    Transform ResizeHandleUnderCursor()
+    {
+        var es = EventSystem.current;
+        if (es == null) return null;
+
+        var hits = new List<RaycastResult>();
+        es.RaycastAll(new PointerEventData(es) { position = Input.mousePosition }, hits);
+        if (hits.Count == 0) return null;
+
+        var handle = hits[0].gameObject.GetComponentInParent<GH::UI.Dialogs.uDialog_ResizeListener>();
+        if (handle == null) return null;
+        var win = FindDraggable(handle.transform, out bool isIcon);
+        return isIcon ? null : win;
+    }
+
+    // Finds the window or desktop icon under the cursor that can be dragged between monitors
     Transform DraggableUnderCursor(out bool isIcon)
     {
         isIcon = false;
@@ -2023,6 +2149,296 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         return null;
     }
 
+    // The icon that follows the cursor while a file is being dragged is positioned by the game using the raw mouse
+    // position, so it would sit off-screen on other monitors. Keep it on the monitor the cursor is on.
+    void KeepDragIconOnCursor()
+    {
+        if (GH::Util.OS.iconDrag == null || !Input.GetMouseButton(0)) return;
+
+        var copy = FindDragCopy() as RectTransform;
+        if (copy == null) return;
+
+        GetMouse(out int display, out Vector2 mousePos);
+        if (!containers.TryGetValue(display, out var layer) || layer == null) return;
+
+        if (copy.parent != layer)
+        {
+            copy.SetParent(layer, false);
+            copy.SetAsLastSibling();
+        }
+        if (display == 0) return; // the game positions it itself on the main screen
+
+        if (ScreenToLocal(layer, mousePos, out Vector2 local))
+            copy.localPosition = new Vector3(local.x, local.y, copy.localPosition.z);
+    }
+
+    // ---------------- Desktop icons on other monitors ----------------
+
+    // Gives an extra monitor's icon layer the same size, position and grid settings as the real desktop's icon layer
+    void CopyIconGrid(RectTransform dst)
+    {
+        var desktop = GH::DesktopFinder.Singleton;
+        var srcGO = desktop != null ? desktop.contenido : null;
+        var src = srcGO != null ? srcGO.transform as RectTransform : null;
+        if (src == null || src == mainContainer)
+        {
+            LogOnce("Couldn't find the desktop's icon layer to copy, so extra monitors will have no icon grid.");
+            return;
+        }
+
+        dst.anchorMin = src.anchorMin;
+        dst.anchorMax = src.anchorMax;
+        dst.pivot = src.pivot;
+        dst.anchoredPosition = src.anchoredPosition;
+        dst.sizeDelta = src.sizeDelta;
+
+        var grid = srcGO.GetComponent<GridLayoutGroup>();
+        if (grid != null)
+        {
+            var g = dst.gameObject.AddComponent<GridLayoutGroup>();
+            g.padding = new RectOffset(grid.padding.left, grid.padding.right, grid.padding.top, grid.padding.bottom);
+            g.cellSize = grid.cellSize;
+            g.spacing = grid.spacing;
+            g.startCorner = grid.startCorner;
+            g.startAxis = grid.startAxis;
+            g.childAlignment = grid.childAlignment;
+            g.constraint = grid.constraint;
+            g.constraintCount = grid.constraintCount;
+            return;
+        }
+
+        var lg = srcGO.GetComponent<HorizontalOrVerticalLayoutGroup>();
+        if (lg != null)
+        {
+            HorizontalOrVerticalLayoutGroup c = lg is VerticalLayoutGroup
+                ? (HorizontalOrVerticalLayoutGroup)dst.gameObject.AddComponent<VerticalLayoutGroup>()
+                : dst.gameObject.AddComponent<HorizontalLayoutGroup>();
+            c.padding = new RectOffset(lg.padding.left, lg.padding.right, lg.padding.top, lg.padding.bottom);
+            c.spacing = lg.spacing;
+            c.childAlignment = lg.childAlignment;
+            c.childControlWidth = lg.childControlWidth;
+            c.childControlHeight = lg.childControlHeight;
+            c.childForceExpandWidth = lg.childForceExpandWidth;
+            c.childForceExpandHeight = lg.childForceExpandHeight;
+            return;
+        }
+
+        LogOnce($"The desktop's icon layer '{src.name}' has no grid or layout group to copy; icons on extra monitors won't line up. Press F8 to log what it has.");
+    }
+
+    // Keeps every desktop icon under the layer of the monitor it belongs to. The game keeps its own list of icons,
+    // so where they sit in the hierarchy doesn't matter to it, but new icons always appear on the main desktop.
+    void SyncDesktopIcons()
+    {
+        if (iconSpots.Count == 0) return; // no icon lives on another monitor, so there's nothing to look after
+        var desktop = GH::DesktopFinder.Singleton;
+        if (desktop == null || desktop.contenido == null) return;
+        var home = desktop.contenido.transform;
+        var icons = desktop.GetObjetosActuales();
+        if (icons == null) return;
+
+        var dragging = GH::Util.OS.iconDrag;
+        foreach (var go in icons)
+        {
+            if (go == null || !(go.transform is RectTransform rt)) continue;
+
+            iconSpots.TryGetValue(go.name, out var spot);
+            RectTransform target = null;
+            if (spot != null && spot.Display > 0) iconContainers.TryGetValue(spot.Display, out target);
+
+            var le = go.GetComponent<LayoutElement>();
+            if (target == null)
+            {
+                // Belongs on the main screen (or its monitor isn't on this session)
+                if (rt.parent != home && !IsSecondaryIconLayer(rt.parent)) continue; // the game has it somewhere we don't manage
+                if (rt.parent != home)
+                {
+                    rt.SetParent(home, false);
+                    if (le != null) le.ignoreLayout = false;
+                }
+                continue;
+            }
+
+            if (rt.parent != target)
+            {
+                rt.SetParent(target, false);
+                if (spot.Free) FromNorm(rt, target, spot.Norm);
+                Logger.LogInfo($"Put icon '{go.name}' on display {spot.Display} ({(spot.Free ? "free position" : "icon grid")}).");
+            }
+            if (le != null && go != (dragging != null ? dragging.gameObject : null) && le.ignoreLayout != spot.Free)
+                le.ignoreLayout = spot.Free;
+        }
+    }
+
+    bool IsSecondaryIconLayer(Transform t)
+    {
+        int d = IconDisplayOf(t);
+        return d > 0;
+    }
+
+    // Drops a desktop icon at the cursor on an extra monitor
+    void PlaceIconOnDisplay(GH::IconoVentana icon, int display)
+    {
+        if (!iconContainers.TryGetValue(display, out var target) || target == null) return;
+        var rt = (RectTransform)icon.transform;
+        GetMouse(out _, out Vector2 mousePos);
+
+        if (rt.parent != target) rt.SetParent(target, false);
+        var le = icon.GetComponent<LayoutElement>();
+        if (le != null) le.ignoreLayout = true;
+        if (ScreenToLocal(target, mousePos, out Vector2 local))
+            rt.localPosition = new Vector3(local.x, local.y, rt.localPosition.z);
+
+        iconSpots[icon.gameObject.name] = new IconSpot { Display = display, Free = true, Norm = ToNorm(rt, target) };
+        iconSpotsDirty = true;
+        Logger.LogInfo($"Moved icon '{icon.gameObject.name}' to display {display}.");
+    }
+
+    // Runs after the game handles a drop on the main desktop: an icon that came from another monitor belongs here now
+    void IconDroppedOnMain(GH::IconoVentana icon)
+    {
+        var desktop = GH::DesktopFinder.Singleton;
+        if (icon == null || desktop == null || desktop.contenido == null) return;
+        if (GH::Util.OS.iconDrag != null) return; // the game didn't take the drop
+        if (!IsSecondaryIconLayer(icon.transform.parent)) return;
+
+        icon.transform.SetParent(desktop.contenido.transform, true); // keeps the spot the game just gave it
+        if (iconSpots.Remove(icon.gameObject.name)) iconSpotsDirty = true;
+        Logger.LogInfo($"Moved icon '{icon.gameObject.name}' back to the main screen.");
+    }
+
+    // "Align to Grid" puts every icon back in its monitor's grid
+    void IconsAligned()
+    {
+        foreach (var spot in iconSpots.Values)
+            if (spot.Display > 0 && spot.Free) { spot.Free = false; iconSpotsDirty = true; }
+        SyncDesktopIcons();
+    }
+
+    // F8: writes what the desktop's icon layers look like, to help work out why icons aren't lining up
+    void DumpDesktopIcons()
+    {
+        var desktop = GH::DesktopFinder.Singleton;
+        if (desktop == null || desktop.contenido == null) { Logger.LogInfo("Icon dump: no desktop finder yet."); return; }
+
+        var src = desktop.contenido.transform as RectTransform;
+        Logger.LogInfo($"Icon dump: desktop icon layer is '{GetPath(src)}' (mod treats '{(mainIcons == null ? "none" : GetPath(mainIcons))}' as main icons), " +
+                       $"anchors {src.anchorMin}-{src.anchorMax}, pivot {src.pivot}, pos {src.anchoredPosition}, size {src.sizeDelta}, rect {src.rect.size}");
+        DumpLayer("main", src);
+        foreach (var kv in iconContainers)
+            if (kv.Key != 0 && kv.Value != null) DumpLayer($"display {kv.Key}", kv.Value);
+        Logger.LogInfo($"Icon dump: {iconSpots.Count} icon(s) assigned to monitors: " +
+                       string.Join(", ", iconSpots.Select(kv => $"{kv.Key}=>{kv.Value.Display}{(kv.Value.Free ? "*" : "")}")));
+    }
+
+    void DumpLayer(string label, RectTransform layer)
+    {
+        var comps = string.Join(", ", layer.GetComponents<Component>().Where(c => c != null).Select(c => c.GetType().Name));
+        Logger.LogInfo($"Icon dump [{label}]: {layer.childCount} child(ren), components: {comps}");
+
+        var grid = layer.GetComponent<GridLayoutGroup>();
+        if (grid != null)
+            Logger.LogInfo($"Icon dump [{label}]: grid cell {grid.cellSize}, spacing {grid.spacing}, padding L{grid.padding.left} R{grid.padding.right} T{grid.padding.top} B{grid.padding.bottom}, " +
+                           $"corner {grid.startCorner}, axis {grid.startAxis}, align {grid.childAlignment}, constraint {grid.constraint} {grid.constraintCount}");
+
+        for (int i = 0; i < Mathf.Min(6, layer.childCount); i++)
+        {
+            var child = layer.GetChild(i) as RectTransform;
+            var le = child.GetComponent<LayoutElement>();
+            Logger.LogInfo($"Icon dump [{label}]: #{i} '{child.name}' ignoreLayout={(le == null ? "n/a" : le.ignoreLayout.ToString())} localPos {child.localPosition} size {child.rect.size}");
+        }
+    }
+
+    void LoadIconSpots()
+    {
+        try
+        {
+            if (!File.Exists(IconSpotsFile)) return;
+            foreach (var line in File.ReadAllLines(IconSpotsFile))
+            {
+                var parts = line.Split('\t');
+                if (parts.Length != 7) continue;
+                if (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int display) || display < 1) continue;
+
+                var f = new float[4];
+                bool ok = true;
+                for (int i = 0; i < 4; i++)
+                    ok &= float.TryParse(parts[i + 3], NumberStyles.Float, CultureInfo.InvariantCulture, out f[i]);
+                if (ok) iconSpots[parts[0]] = new IconSpot { Display = display, Free = parts[2] == "1", Norm = new Rect(f[0], f[1], f[2], f[3]) };
+            }
+            Logger.LogInfo($"Loaded {iconSpots.Count} desktop icon monitor assignment(s).");
+        }
+        catch (System.Exception e)
+        {
+            Logger.LogWarning($"Couldn't load desktop icon positions: {e.Message}");
+        }
+    }
+
+    void SaveIconSpots()
+    {
+        iconSpotsDirty = false;
+        try
+        {
+            var lines = iconSpots.Select(kv => string.Join("\t",
+                kv.Key,
+                kv.Value.Display.ToString(CultureInfo.InvariantCulture),
+                kv.Value.Free ? "1" : "0",
+                F(kv.Value.Norm.x), F(kv.Value.Norm.y), F(kv.Value.Norm.width), F(kv.Value.Norm.height)));
+            File.WriteAllLines(IconSpotsFile, lines.ToArray());
+        }
+        catch (System.Exception e)
+        {
+            Logger.LogWarning($"Couldn't save desktop icon positions: {e.Message}");
+        }
+    }
+
+    // The empty desktop on another monitor has to act like the real desktop: clicks (including the right-click menu)
+    // are passed on to the main desktop, and files dropped on it are copied to the desktop folder
+    void DesktopClicked(PointerEventData e, int display)
+    {
+        try
+        {
+            if (mainContainer == null) return;
+            var target = mainContainer.gameObject;
+
+            if (e.button == PointerEventData.InputButton.Right && target.GetComponent<GH::InteractableContextual>() == null)
+            {
+                // wherever the game keeps the desktop's right-click menu
+                if (mainIcons != null && mainIcons.GetComponent<GH::InteractableContextual>() != null) target = mainIcons.gameObject;
+                else LogOnce($"Couldn't find the desktop's right-click menu on '{mainContainer.name}' or '{IconsName}'; right-clicking the desktop on other monitors won't work.");
+            }
+
+            ExecuteEvents.Execute(target, e, ExecuteEvents.pointerClickHandler);
+        }
+        catch (System.Exception ex) { HandleError("DesktopClick", ex); }
+    }
+
+    void DesktopDropped(PointerEventData e, int display)
+    {
+        try
+        {
+            var dragged = GH::Util.OS.iconDrag;
+            var desktop = GH::DesktopFinder.Singleton;
+            if (dragged == null || desktop == null) return;
+            if (dragged.GetVentanaFinder() is GH::DesktopFinder)
+            {
+                // An icon that's already on a desktop: it moves to this monitor
+                PlaceIconOnDisplay(dragged, display);
+                GH::Util.OS.iconDrag = null;
+                return;
+            }
+
+            // A file from a window: it's copied to the desktop, and its icon should show up on this monitor
+            iconSpots[dragged.GetNombre()] = new IconSpot { Display = display, Free = false };
+            iconSpotsDirty = true;
+
+            // The copy window that opens should appear on this monitor too
+            pendingDialog = new PendingDialog { Display = display, Anchor = null, Until = Time.unscaledTime + 0.5f };
+            desktop.OnDrop(e);
+        }
+        catch (System.Exception ex) { HandleError("DesktopDrop", ex); }
+    }
+
     // Places something so its center sits under the cursor
     void CenterOnCursor(RectTransform rt, RectTransform layer, Vector2 mousePos)
     {
@@ -2037,7 +2453,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     // The game's dialog code (for example, the Save Program window) looks for the desktop by working up from
     // the app's window, and crashes if that window is on another monitor. These patches briefly put the app's
     // window back inside the desktop while that code runs, then return it and move the dialog next to it.
-        void PatchGame()
+    void PatchGame()
     {
         var harmony = new Harmony(Guid);
 
@@ -2055,6 +2471,19 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         catch (System.Exception e) { Logger.LogWarning($"Couldn't access InteractableContextual.contextualMenu: {e.Message}"); }
         PatchMethod(harmony, AccessTools.Method(typeof(GH::InteractableContextual), "Start"), "InteractableContextual.Start",
             postfix: nameof(ContextStartPostfix));
+        // Text fields and Notepad look for their clipboard menu when they start, and their Start doesn't call the
+        // base one above, so a window that opens on another monitor would never find it
+        try
+        {
+            clipboardMenuRef = AccessTools.FieldRefAccess<GH::ClipboardInteractableContextual, GH::ContextualMenuClipboard>("clipboardContextual");
+            clipboardTextMenuRef = AccessTools.FieldRefAccess<GH::ClipboardICText, GH::ContextualMenuClipboard>("clipboardContextual");
+        }
+        catch (System.Exception e) { Logger.LogWarning($"Couldn't access clipboardContextual: {e.Message}"); }
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::ClipboardInteractableContextual), "Start"), "ClipboardInteractableContextual.Start",
+            postfix: nameof(ClipboardStartPostfix));
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::ClipboardICText), "Start"), "ClipboardICText.Start",
+            postfix: nameof(ClipboardTextStartPostfix));
+
         // Every kind of right-click menu: files and folders, text (Notepad, web pages), and the Terminal
         foreach (var menuType in new[] { typeof(GH::ContextualMenu), typeof(GH::ContextualMenuClipboard), typeof(GH::ContextualMenuTerminal) })
             foreach (var m in AccessTools.GetDeclaredMethods(menuType).Where(m => m.Name == "OpenMenu"))
@@ -2067,6 +2496,39 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         // Text fields (like the Browser's address bar) have their own right-click handler that also looks for its menu from the window
         PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::ClipboardInteractableContextual), "OnPointerClick"),
             "ClipboardInteractableContextual.OnPointerClick", prefix: nameof(DialogPrefix), finalizer: nameof(InDesktopFinalizer));
+
+        // "Center window" centers on the main screen's size, so windows on other monitors need centering on their own monitor
+        PatchMethod(harmony, AccessTools.Method(typeof(GH::Ventana), "CenterWindow"), "Ventana.CenterWindow",
+            postfix: nameof(CenterWindowPostfix));
+
+        // Dragging files: the game creates the dragged icon and finds the taskbar (for the copy window) by working up from
+        // the icon's window, which fails on other monitors. The drag icon is then kept under the cursor by KeepDragIconOnCursor.
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::IconoVentana), "OnBeginDrag"), "IconoVentana.OnBeginDrag",
+            prefix: nameof(DialogPrefix), finalizer: nameof(InDesktopFinalizer));
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::IconoVentana), "OnDrop"), "IconoVentana.OnDrop",
+            prefix: nameof(DialogPrefix), finalizer: nameof(DialogFinalizer));
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::IconoVentana), "ResumeConfirmDialog"), "IconoVentana.ResumeConfirmDialog",
+            prefix: nameof(DialogPrefix), finalizer: nameof(DialogFinalizer));
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::VentanaFinder), "OnDrop"), "VentanaFinder.OnDrop",
+            prefix: nameof(DialogPrefix), finalizer: nameof(DialogFinalizer));
+
+        // Desktop icons on other monitors: dropping one on the main desktop brings it back, and "Align to Grid" (or the game
+        // restoring saved icon spots) must also reach icons on the other monitors
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::DesktopFinder), "OnDrop"), "DesktopFinder.OnDrop",
+            prefix: nameof(DesktopDropPrefix), postfix: nameof(DesktopDropPostfix));
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::DesktopFinder), "AlignIcons"), "DesktopFinder.AlignIcons",
+            postfix: nameof(IconsChangedPostfix));
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::DesktopFinder), "LoadIconsPosition"), "DesktopFinder.LoadIconsPosition",
+            postfix: nameof(IconsLoadedPostfix));
+        // The game only recolors the icons under its own icon layer when the theme changes
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::DesktopFinder), "SetColors"), "DesktopFinder.SetColors",
+            postfix: nameof(DesktopColorsPostfix));
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::VentanaFinder), "ResumeConfirmDialog"), "VentanaFinder.ResumeConfirmDialog",
+            prefix: nameof(DialogPrefix), finalizer: nameof(DialogFinalizer));
+
+        // "Login to a different email account" launches a second Mail window; open it over the client the button is in
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::MailWindow), "OnClickLogin"), "MailWindow.OnClickLogin",
+            prefix: nameof(OpensWindowFromPrefix));
 
         // Menus go back to the desktop as soon as they close, so the game always finds them where it expects
         foreach (var menuType in new[] { typeof(GH::ContextualMenu), typeof(GH::ContextualMenuClipboard), typeof(GH::ContextualMenuTerminal) })
@@ -2149,6 +2611,26 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         catch { }
     }
 
+    static void ClipboardStartPostfix(GH::ClipboardInteractableContextual __instance)
+    {
+        try
+        {
+            if (instance == null || clipboardMenuRef == null || instance.mainClipboardMenu == null) return;
+            if (clipboardMenuRef(__instance) == null) clipboardMenuRef(__instance) = instance.mainClipboardMenu;
+        }
+        catch { }
+    }
+
+    static void ClipboardTextStartPostfix(GH::ClipboardICText __instance)
+    {
+        try
+        {
+            if (instance == null || clipboardTextMenuRef == null || instance.mainClipboardMenu == null) return;
+            if (clipboardTextMenuRef(__instance) == null) clipboardTextMenuRef(__instance) = instance.mainClipboardMenu;
+        }
+        catch { }
+    }
+
     static void MenuOpenPrefix(GH::ContextualMenu __instance)
     {
         try { if (instance != null) instance.MenuComeHome(__instance.transform); }
@@ -2165,6 +2647,109 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     {
         try { if (instance != null) instance.MenuComeHome(__instance.transform); }
         catch { }
+    }
+
+    // For buttons that launch another window (the game then opens it on the main desktop): the next window to open should
+    // appear on this app's monitor, centered over it. The window is shown a moment after the click, so allow a little longer.
+    static void OpensWindowFromPrefix(object __instance)
+    {
+        try { if (instance != null) instance.ExpectWindowFrom(__instance as Component); }
+        catch { }
+    }
+
+    void ExpectWindowFrom(Component caller)
+    {
+        if (caller == null || mainContainer == null) return;
+        var win = FindDraggable(caller.transform, out bool isIcon);
+        if (win == null || isIcon) return;
+
+        int display = DisplayOf(win.parent);
+        if (display < 0) return;
+        pendingDialog = new PendingDialog { Display = display, Anchor = win, Until = Time.unscaledTime + 1.5f };
+    }
+
+    static void DesktopDropPrefix(out GH::IconoVentana __state)
+    {
+        __state = GH::Util.OS.iconDrag; // the game clears this while handling the drop
+    }
+
+    static void DesktopDropPostfix(GH::IconoVentana __state)
+    {
+        try { if (instance != null) instance.IconDroppedOnMain(__state); }
+        catch { }
+    }
+
+    static void DesktopColorsPostfix(GH::DesktopFinder __instance, GH::UI_Theme theme)
+    {
+        try { if (instance != null) instance.ColorExtraMonitorIcons(__instance, theme); }
+        catch (System.Exception e) { if (instance != null) instance.LogOnce($"Couldn't recolor desktop icons on other monitors: {e.Message}"); }
+    }
+
+    static System.Reflection.MethodInfo symLinkConfigMethod;
+
+    // Does what the game's SetColors does for its own desktop icons, for the icons on the other monitors
+    void ColorExtraMonitorIcons(GH::DesktopFinder desktop, GH::UI_Theme theme)
+    {
+        if (theme == null) return;
+        if (symLinkConfigMethod == null) symLinkConfigMethod = AccessTools.Method(typeof(GH::DesktopFinder), "ApplySymLinkConfig");
+
+        foreach (var kv in iconContainers)
+        {
+            if (kv.Key == 0 || kv.Value == null) continue;
+            foreach (var icon in kv.Value.GetComponentsInChildren<GH::IconoVentana>())
+            {
+                var button = icon.GetComponent<Button>();
+                if (button == null) continue;
+
+                var colors = button.colors;
+                colors.normalColor = theme.desktopIcons;
+                colors.pressedColor = theme.desktopIcons;
+                colors.selectedColor = theme.desktopIconsHighlight;
+                colors.highlightedColor = theme.desktopIcons;
+                button.colors = colors;
+
+                var back = icon.transform.Find("fondoTexto");
+                var backImage = back != null ? back.GetComponent<Image>() : null;
+                if (backImage != null) backImage.color = theme.desktopIcons;
+
+                var label = button.GetComponentInChildren<TMPro.TMP_Text>();
+                if (label != null) label.color = theme.desktopIconsText;
+
+                if (symLinkConfigMethod != null) symLinkConfigMethod.Invoke(desktop, new object[] { icon });
+            }
+        }
+    }
+
+    static void IconsChangedPostfix()
+    {
+        try { if (instance != null) instance.IconsAligned(); }
+        catch { }
+    }
+
+    static void IconsLoadedPostfix()
+    {
+        try { if (instance != null) instance.SyncDesktopIcons(); }
+        catch { }
+    }
+
+    // Puts the window in the middle of its own monitor (the game always uses the main screen's middle)
+    static void CenterWindowPostfix(GH::Ventana __instance)
+    {
+        try { if (instance != null) instance.CenterOnOwnMonitor(__instance.transform); }
+        catch { }
+    }
+
+    void CenterOnOwnMonitor(Transform t)
+    {
+        var win = FindDraggable(t, out bool isIcon) as RectTransform;
+        if (win == null || isIcon) return;
+
+        int display = DisplayOf(win.parent);
+        if (display <= 0 || !containers.TryGetValue(display, out var target) || target == null) return; // main screen: the game's own centering is right
+
+        Rect r = LocalRectOf(win);
+        Vector2 center = WorkArea(target).center;
+        SetLocalRect(win, new Rect(center.x - r.width / 2f, center.y - r.height / 2f, r.width, r.height));
     }
 
     // Puts a menu back where it normally lives in the desktop
@@ -2233,11 +2818,15 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         foreach (var kv in popupLayers) SyncNestedCanvases(kv.Value, kv.Key);
     }
 
+    static readonly List<Canvas> canvasScratch = new List<Canvas>();
+
     static void SyncNestedCanvases(Transform root, int display)
     {
         if (root == null) return;
-        foreach (var c in root.GetComponentsInChildren<Canvas>(true))
+        root.GetComponentsInChildren(true, canvasScratch); // fills a reused list instead of making a new array
+        foreach (var c in canvasScratch)
             if (!c.isRootCanvas && c.targetDisplay != display) c.targetDisplay = display;
+        canvasScratch.Clear();
     }
 
 
@@ -2249,37 +2838,11 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         GetMouse(out int display, out _);
 
         GraphicRaycaster caster = null;
-        if (display != 0 && secondaryCanvases.TryGetValue(display, out var canvasGO) && canvasGO != null)
-            caster = canvasGO.GetComponent<GraphicRaycaster>();
-        if (caster == null)
-            caster = mainCanvas.GetComponent<GraphicRaycaster>();
+        if (display != 0) secondaryCasters.TryGetValue(display, out caster);
+        if (caster == null) caster = mainCaster;
 
         if (caster != null && GH::PowerUI.Input.UnityUICaster != caster)
             GH::PowerUI.Input.UnityUICaster = caster;
-    }
-
-    // Temporary: logs what's under the cursor on a right-click, and which game scripts are on it and above it
-    void LogRightClickTarget()
-    {
-        GetMouse(out int display, out _);
-        var es = EventSystem.current;
-        if (es == null) return;
-
-        var hits = new List<RaycastResult>();
-        es.RaycastAll(new PointerEventData(es) { position = Input.mousePosition }, hits);
-        if (hits.Count == 0)
-        {
-            Logger.LogInfo($"Right-click on display {display}: nothing under the cursor.");
-            return;
-        }
-
-        for (int i = 0; i < Mathf.Min(3, hits.Count); i++)
-        {
-            var t = hits[i].gameObject.transform;
-            var scripts = string.Join(", ", t.GetComponentsInParent<MonoBehaviour>(true)
-                .Select(c => c.GetType().Name).Distinct().Take(20));
-            Logger.LogInfo($"Right-click on display {display}, hit {i + 1}: '{GetPath(t)}' (scripts: {scripts})");
-        }
     }
 
     static void DialogPrefix(object __instance, out TempMove __state)
@@ -2301,7 +2864,17 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     {
         if (caller == null || mainContainer == null) return null;
         var win = FindDraggable(caller.transform, out bool isIcon);
-        if (win == null || isIcon) return null;
+        if (win == null) return null;
+
+        if (isIcon)
+        {
+            // A desktop icon on another monitor: the game looks for the desktop from the icon, so put it back for a moment
+            int iconDisplay = IconDisplayOf(win.parent);
+            if (iconDisplay <= 0 || mainIcons == null) return null;
+            var moved = new TempMove { Window = win, Parent = win.parent, LocalPos = win.localPosition, Display = iconDisplay, Sibling = win.GetSiblingIndex() };
+            win.SetParent(mainIcons, false);
+            return moved;
+        }
 
         int display = DisplayOf(win.parent);
         if (display < 0) return null;
@@ -2324,6 +2897,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         if (state.Window == null || state.Display <= 0 || state.Parent == null) return;
         state.Window.SetParent(state.Parent, false);
         state.Window.localPosition = state.LocalPos;
+        if (state.Sibling >= 0) state.Window.SetSiblingIndex(Mathf.Min(state.Sibling, state.Parent.childCount - 1));
     }
 
     // Like DialogFinalizer, but for game code that doesn't open a dialog (for example, a right-click)
@@ -2338,6 +2912,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     // Unity's "is this point in this box" helpers, used by the game with the raw mouse position
     static void RectPointPrefix(RectTransform __0, ref Vector2 __1)
     {
+        if (inOwnPointCall) return;
         try { FixScreenPoint(__0, ref __1); }
         catch { }
     }
@@ -2426,10 +3001,27 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         else { display = (int)rel.z; pos = rel; }
     }
 
+    // Set while the mod calls Unity's own point helpers with a position that's already relative to a monitor,
+    // so RectPointPrefix doesn't try to convert it a second time
+    static bool inOwnPointCall;
+
     bool ScreenToLocal(RectTransform container, Vector2 screenPos, out Vector2 local)
     {
         var canvas = container.GetComponentInParent<Canvas>().rootCanvas;
         Camera cam = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
-        return RectTransformUtility.ScreenPointToLocalPointInRectangle(container, screenPos, cam, out local);
+        inOwnPointCall = true;
+        try { return RectTransformUtility.ScreenPointToLocalPointInRectangle(container, screenPos, cam, out local); }
+        finally { inOwnPointCall = false; }
     }
+}
+
+// Sits on an invisible layer over the desktop of each extra monitor and hands clicks and drops to the plugin
+public class MultiMonitorDesktopProxy : MonoBehaviour, IPointerClickHandler, IDropHandler
+{
+    public int Display;
+    public System.Action<PointerEventData, int> Clicked;
+    public System.Action<PointerEventData, int> Dropped;
+
+    public void OnPointerClick(PointerEventData eventData) { if (Clicked != null) Clicked(eventData, Display); }
+    public void OnDrop(PointerEventData eventData) { if (Dropped != null) Dropped(eventData, Display); }
 }
