@@ -2,9 +2,6 @@
 ## AI Disclaimer - I am not a developer
 I am not a professional developer. This application was made with **heavy** assistance of Claude Opus 5.5 and Sonnet 5. I did testing on my own device but I cannot validate that it will work on other devices. If you encounter an error please let me know and I'll look into it. Please include your LogOutput.log file from \Grey Hack\BepInEx\LogOutput.log
 
-## Multiplayer
-I have not yet tested this with multiplayer or confirmed it works. Please only use this in Singleplayer. If this is validate in Multiplayer then this section will be removed.
-
 # GHMultiMonitor
 
 GHMultiMonitor is a BepInEx plugin for Grey Hack that extends the in-game desktop across multiple monitors. 
