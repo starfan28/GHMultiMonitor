@@ -96,6 +96,14 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     readonly List<KeyValuePair<Transform, float>> openedScratch = new List<KeyValuePair<Transform, float>>();
     float nextSnapshotCapture;
     bool overlaysShown;
+
+    // Windows on other monitors that the maximize button has filled the screen with: where they were before
+    class MaximizedFrom
+    {
+        public Rect Rect;
+        public bool WasSnapped;
+    }
+    readonly Dictionary<RectTransform, MaximizedFrom> maximizedFrom = new Dictionary<RectTransform, MaximizedFrom>();
     bool placementsDirty;
     float nextPlacementRefresh;
     string PlacementsFile => Path.Combine(Paths.ConfigPath, Guid + ".windows.txt");
@@ -811,6 +819,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         openSnapshots.Clear();
         skipCache.Clear();
         secondaryCasters.Clear();
+        maximizedFrom.Clear();
         lastBackgroundDescription = null;
         loggedNoBackground = false;
 
@@ -1099,6 +1108,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
             // Forget windows that have been destroyed
             foreach (var k in windowActive.Keys.Where(k => k == null).ToList()) windowActive.Remove(k);
             foreach (var k in skipCache.Keys.Where(k => k == null).ToList()) skipCache.Remove(k);
+            foreach (var k in maximizedFrom.Keys.Where(k => k == null).ToList()) maximizedFrom.Remove(k);
 
             // Keep remembered windows' saved positions current (e.g. after resizing them)
             foreach (var c in containers.Values)
@@ -2299,10 +2309,19 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     {
         var desktop = GH::DesktopFinder.Singleton;
         if (icon == null || desktop == null || desktop.contenido == null) return;
-        if (GH::Util.OS.iconDrag != null) return; // the game didn't take the drop
         if (!IsSecondaryIconLayer(icon.transform.parent)) return;
 
-        icon.transform.SetParent(desktop.contenido.transform, true); // keeps the spot the game just gave it
+        // The game treats it as a move on the desktop when the file is already in the desktop folder
+        var folder = desktop.GetCurrentFolder();
+        if (folder == null || !folder.ExisteFichero(icon.GetFichero())) return;
+
+        if (GH::Util.OS.iconDrag == icon) GH::Util.OS.iconDrag = null; // the game leaves this set when its drop code fails
+        // Keep the spot the game just gave it, but not the world size: monitors scale the UI differently, so
+        // SetParent(..., true) would shrink or grow the icon by the ratio between the two scales
+        Vector3 spot = icon.transform.position;
+        icon.transform.SetParent(desktop.contenido.transform, false);
+        icon.transform.localScale = Vector3.one;
+        icon.transform.position = spot;
         if (iconSpots.Remove(icon.gameObject.name)) iconSpotsDirty = true;
         Logger.LogInfo($"Moved icon '{icon.gameObject.name}' back to the main screen.");
     }
@@ -2497,6 +2516,11 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::ClipboardInteractableContextual), "OnPointerClick"),
             "ClipboardInteractableContextual.OnPointerClick", prefix: nameof(DialogPrefix), finalizer: nameof(InDesktopFinalizer));
 
+        // The maximize button animates the window to the middle of the main screen's size, so on a smaller or differently
+        // sized monitor the window ends up off the edge. On other monitors it does what dragging to the top edge does.
+        PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::UI.Dialogs.uDialog), "Maximize"), "uDialog.Maximize",
+            prefix: nameof(MaximizePrefix));
+
         // "Center window" centers on the main screen's size, so windows on other monitors need centering on their own monitor
         PatchMethod(harmony, AccessTools.Method(typeof(GH::Ventana), "CenterWindow"), "Ventana.CenterWindow",
             postfix: nameof(CenterWindowPostfix));
@@ -2515,7 +2539,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         // Desktop icons on other monitors: dropping one on the main desktop brings it back, and "Align to Grid" (or the game
         // restoring saved icon spots) must also reach icons on the other monitors
         PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::DesktopFinder), "OnDrop"), "DesktopFinder.OnDrop",
-            prefix: nameof(DesktopDropPrefix), postfix: nameof(DesktopDropPostfix));
+            prefix: nameof(DesktopDropPrefix), finalizer: nameof(DesktopDropFinalizer));
         PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::DesktopFinder), "AlignIcons"), "DesktopFinder.AlignIcons",
             postfix: nameof(IconsChangedPostfix));
         PatchMethod(harmony, AccessTools.DeclaredMethod(typeof(GH::DesktopFinder), "LoadIconsPosition"), "DesktopFinder.LoadIconsPosition",
@@ -2673,10 +2697,13 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         __state = GH::Util.OS.iconDrag; // the game clears this while handling the drop
     }
 
-    static void DesktopDropPostfix(GH::IconoVentana __state)
+    // A finalizer, not a postfix: the game's own drop code throws (it fails to save the icon positions as JSON) after it has
+    // already put the icon where it was dropped, and a postfix would never run
+    static System.Exception DesktopDropFinalizer(GH::IconoVentana __state, System.Exception __exception)
     {
         try { if (instance != null) instance.IconDroppedOnMain(__state); }
         catch { }
+        return __exception;
     }
 
     static void DesktopColorsPostfix(GH::DesktopFinder __instance, GH::UI_Theme theme)
@@ -2730,6 +2757,49 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     {
         try { if (instance != null) instance.SyncDesktopIcons(); }
         catch { }
+    }
+
+    // Returning false stops the game's own maximize animation (see MaximizeOnOwnMonitor)
+    static bool MaximizePrefix(GH::UI.Dialogs.uDialog __instance)
+    {
+        try { if (instance != null && instance.MaximizeOnOwnMonitor(__instance)) return false; }
+        catch (System.Exception e) { if (instance != null) instance.LogOnce($"Couldn't maximize on another monitor, using the game's own way: {e.Message}"); }
+        return true;
+    }
+
+    // The game's maximize animation heads for the middle of the main screen's size, which is wrong on any other monitor.
+    // For windows there, maximize does exactly what dragging the window to the top edge does, and pressing it again
+    // puts the window back.
+    bool MaximizeOnOwnMonitor(GH::UI.Dialogs.uDialog dialog)
+    {
+        var win = dialog.transform as RectTransform;
+        if (win == null) return false;
+
+        int display = DisplayOf(win.parent);
+        if (display <= 0 || !containers.TryGetValue(display, out var container) || container == null) return false; // main screen: the game's own is fine
+
+        if (dialog.Event_OnMaximize != null) dialog.Event_OnMaximize.Invoke(dialog); // the game does this first
+        var ventana = dialog.GetComponentInChildren<GH::Ventana>();
+
+        // The click on the button is still being tracked as a press on the window. If it stayed, moving the window here
+        // would look like the start of a drag, which would undo the size and put the window under the cursor.
+        EndPress();
+
+        // Still maximized if it hasn't been dragged or resized since (either one clears the snapped size)
+        if (maximizedFrom.TryGetValue(win, out var before) && restoreSizes.ContainsKey(win))
+        {
+            maximizedFrom.Remove(win);
+            if (!before.WasSnapped) restoreSizes.Remove(win);
+            SetLocalRect(win, before.Rect);
+            if (ventana != null) ventana.SetMaximizedIcon(false);
+            return true;
+        }
+
+        maximizedFrom[win] = new MaximizedFrom { Rect = LocalRectOf(win), WasSnapped = restoreSizes.ContainsKey(win) };
+        ApplySnap(win, container, display, SnapZone.Top); // Top is the same as dragging to the top edge: fill the work area
+        PlaceOnTop(win, container);
+        if (ventana != null) ventana.SetMaximizedIcon(true);
+        return true;
     }
 
     // Puts the window in the middle of its own monitor (the game always uses the main screen's middle)
