@@ -97,13 +97,10 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     float nextSnapshotCapture;
     bool overlaysShown;
 
-    // Windows on other monitors that the maximize button has filled the screen with: where they were before
-    class MaximizedFrom
-    {
-        public Rect Rect;
-        public bool WasSnapped;
-    }
-    readonly Dictionary<RectTransform, MaximizedFrom> maximizedFrom = new Dictionary<RectTransform, MaximizedFrom>();
+    // Where each snapped (or maximized) window was before it was snapped, as fractions of its monitor, so it can be put
+    // back exactly (on the same monitor, or on the one it was snapped to)
+    readonly Dictionary<Transform, Rect> preSnapNorms = new Dictionary<Transform, Rect>();
+    Rect pressOriginNorm; // where the pressed window was when the press began (a drag moves it before it's snapped)
     bool placementsDirty;
     float nextPlacementRefresh;
     string PlacementsFile => Path.Combine(Paths.ConfigPath, Guid + ".windows.txt");
@@ -819,7 +816,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         openSnapshots.Clear();
         skipCache.Clear();
         secondaryCasters.Clear();
-        maximizedFrom.Clear();
+        preSnapNorms.Clear();
         lastBackgroundDescription = null;
         loggedNoBackground = false;
 
@@ -1108,7 +1105,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
             // Forget windows that have been destroyed
             foreach (var k in windowActive.Keys.Where(k => k == null).ToList()) windowActive.Remove(k);
             foreach (var k in skipCache.Keys.Where(k => k == null).ToList()) skipCache.Remove(k);
-            foreach (var k in maximizedFrom.Keys.Where(k => k == null).ToList()) maximizedFrom.Remove(k);
+            foreach (var k in preSnapNorms.Keys.Where(k => k == null).ToList()) preSnapNorms.Remove(k);
 
             // Keep remembered windows' saved positions current (e.g. after resizing them)
             foreach (var c in containers.Values)
@@ -1275,6 +1272,14 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     static void FromNorm(RectTransform win, RectTransform container, Rect n)
     {
         SetLocalRect(win, NormToLocal(container, n));
+    }
+
+    // Close enough to be the same spot on screen (canvas units)
+    static bool SameRect(Rect a, Rect b)
+    {
+        const float eps = 2f;
+        return Mathf.Abs(a.x - b.x) < eps && Mathf.Abs(a.y - b.y) < eps
+            && Mathf.Abs(a.width - b.width) < eps && Mathf.Abs(a.height - b.height) < eps;
     }
 
     static bool Same(Rect a, Rect b)
@@ -1675,7 +1680,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
                 && containers.TryGetValue(zoneDisplay, out var snapContainer)
                 && snapContainer != null && win.parent == snapContainer)
             {
-                ApplySnap(win, snapContainer, zoneDisplay, shownZone);
+                ApplySnap(win, snapContainer, zoneDisplay, shownZone, pressOriginNorm);
             }
             else
             {
@@ -1701,6 +1706,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         if (resized != null)
         {
             restoreSizes.Remove(resized); // no longer the size it had before snapping
+            preSnapNorms.Remove(resized);
             return;
         }
 
@@ -1716,6 +1722,12 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         pressedWindow = win;
         pressedWindowStartPos = win.localPosition;
         grabOffset = new Vector2(win.localPosition.x - local.x, win.localPosition.y - local.y);
+
+        // Remember where the window is now: if this press turns into a drag that ends in a snap, this is the spot to
+        // go back to (not the screen edge it gets dragged to). A window that's already snapped keeps its earlier spot.
+        pressOriginNorm = restoreSizes.ContainsKey(win) && preSnapNorms.TryGetValue(win, out var earlier)
+            ? earlier
+            : ToNorm((RectTransform)win, (RectTransform)win.parent);
     }
 
     void EndPress()
@@ -1825,9 +1837,14 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         }
     }
 
-    void ApplySnap(RectTransform win, RectTransform container, int display, SnapZone zone)
+    // "originNorm" is where the window was before the snap; leave it out when the window hasn't been moved (the maximize button)
+    void ApplySnap(RectTransform win, RectTransform container, int display, SnapZone zone, Rect? originNorm = null)
     {
-        if (!restoreSizes.ContainsKey(win)) restoreSizes[win] = win.rect.size;
+        if (!restoreSizes.ContainsKey(win))
+        {
+            restoreSizes[win] = win.rect.size;
+            preSnapNorms[win] = originNorm ?? ToNorm(win, container); // size and spot from before the first snap
+        }
         SetLocalRect(win, SnapRect(container, zone));
         Logger.LogInfo($"Snapped '{win.name}' to {zone} on display {display}.");
     }
@@ -1838,6 +1855,7 @@ public class MultiMonitorPlugin : BaseUnityPlugin
     {
         if (!restoreSizes.TryGetValue(pressedWindow, out var size)) return;
         restoreSizes.Remove(pressedWindow);
+        preSnapNorms.Remove(pressedWindow);
 
         var rt = (RectTransform)pressedWindow;
         var container = (RectTransform)pressedWindow.parent;
@@ -2767,16 +2785,16 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         return true;
     }
 
-    // The game's maximize animation heads for the middle of the main screen's size, which is wrong on any other monitor.
-    // For windows there, maximize does exactly what dragging the window to the top edge does, and pressing it again
-    // puts the window back.
+    // The game's maximize animation heads for the middle of the main screen and always restores to there, which is wrong
+    // on any other monitor and doesn't put the window back where it was on the main one either. On every monitor, maximize
+    // does exactly what dragging the window to the top edge does, and pressing it again puts the window back.
     bool MaximizeOnOwnMonitor(GH::UI.Dialogs.uDialog dialog)
     {
         var win = dialog.transform as RectTransform;
         if (win == null) return false;
 
         int display = DisplayOf(win.parent);
-        if (display <= 0 || !containers.TryGetValue(display, out var container) || container == null) return false; // main screen: the game's own is fine
+        if (display < 0 || !containers.TryGetValue(display, out var container) || container == null) return false;
 
         if (dialog.Event_OnMaximize != null) dialog.Event_OnMaximize.Invoke(dialog); // the game does this first
         var ventana = dialog.GetComponentInChildren<GH::Ventana>();
@@ -2785,18 +2803,18 @@ public class MultiMonitorPlugin : BaseUnityPlugin
         // would look like the start of a drag, which would undo the size and put the window under the cursor.
         EndPress();
 
-        // Still maximized if it hasn't been dragged or resized since (either one clears the snapped size)
-        if (maximizedFrom.TryGetValue(win, out var before) && restoreSizes.ContainsKey(win))
+        // If the window already fills the monitor (from this button or from dragging it to the top edge), put it back
+        // exactly where it was before it was snapped. Otherwise fill the monitor, the same as dragging to the top edge.
+        if (SameRect(LocalRectOf(win), SnapRect(container, SnapZone.Top)) && preSnapNorms.TryGetValue(win, out var before))
         {
-            maximizedFrom.Remove(win);
-            if (!before.WasSnapped) restoreSizes.Remove(win);
-            SetLocalRect(win, before.Rect);
+            preSnapNorms.Remove(win);
+            restoreSizes.Remove(win);
+            SetLocalRect(win, NormToLocal(container, before));
             if (ventana != null) ventana.SetMaximizedIcon(false);
             return true;
         }
 
-        maximizedFrom[win] = new MaximizedFrom { Rect = LocalRectOf(win), WasSnapped = restoreSizes.ContainsKey(win) };
-        ApplySnap(win, container, display, SnapZone.Top); // Top is the same as dragging to the top edge: fill the work area
+        ApplySnap(win, container, display, SnapZone.Top);
         PlaceOnTop(win, container);
         if (ventana != null) ventana.SetMaximizedIcon(true);
         return true;
